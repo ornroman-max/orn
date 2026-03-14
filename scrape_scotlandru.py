@@ -3,15 +3,18 @@ import csv
 import hashlib
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 SITEMAP_INDEX = "https://scotlandru.com/sitemap_index.xml"
 OUTPUT_DIR = Path("scotlandru_pages")
 TIMEOUT_MS = 60000
+PAGE_RETRY_ATTEMPTS = 2
+PAGE_DELAY_SECONDS = 5
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 
@@ -68,12 +71,27 @@ def file_stem_from_url(url: str):
 
 
 def extract_page_text_via_browser(page, url: str) -> str:
-    response = page.goto(url, wait_until="networkidle", timeout=TIMEOUT_MS)
-    if response is not None and not response.ok:
-        raise RuntimeError(f"HTTP {response.status} for {url}")
+    last_error = None
 
-    body_text = page.locator("body").inner_text(timeout=TIMEOUT_MS)
-    return normalize_text(body_text)
+    for attempt in range(1, PAGE_RETRY_ATTEMPTS + 1):
+        try:
+            response = page.goto(url, wait_until="networkidle", timeout=TIMEOUT_MS)
+            if response is not None and not response.ok:
+                raise RuntimeError(f"HTTP {response.status} for {url}")
+
+            body_text = page.locator("body").inner_text(timeout=TIMEOUT_MS)
+            return normalize_text(body_text)
+        except PlaywrightTimeoutError as exc:
+            last_error = exc
+            if attempt < PAGE_RETRY_ATTEMPTS:
+                print(
+                    f"WARN: timeout while opening {url} (attempt {attempt}/{PAGE_RETRY_ATTEMPTS}), retrying...",
+                    file=sys.stderr,
+                )
+                continue
+            raise
+
+    raise RuntimeError(f"Failed to extract page text for {url}: {last_error}")
 
 
 def main():
@@ -105,6 +123,9 @@ def main():
                     (OUTPUT_DIR / filename).write_text(text + "\n", encoding="utf-8")
                     writer.writerow([url, filename])
                     print(f"[{i}/{len(urls)}] {url} -> {filename}")
+
+                    if i < len(urls):
+                        time.sleep(PAGE_DELAY_SECONDS)
 
             print(f"Done. Saved {len(urls)} pages to {OUTPUT_DIR}")
         finally:
